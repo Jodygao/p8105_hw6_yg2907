@@ -1,0 +1,282 @@
+---
+title: "p8105_hw6_yg2907"
+output: github_document
+date: "2023-12-02"
+---
+
+```{r}
+library(tidyverse)
+library(boot)
+library(broom)
+library(purrr)
+library(ggplot2)
+library(mgcv)
+library(modelr)
+```
+# Problem 1
+
+```{r}
+homicides <- read.csv("./data/homicide-data.csv", na = c("", "NA", "Unknown"))
+
+homicides <- homicides |>
+  mutate(city_state = str_c(city, state, sep = ", "),
+         resolution = case_when(
+         disposition %in% c("Closed without arrest", "Open/No arrest") ~ 0,
+         disposition == "Closed by arrest" ~ 1),
+         victim_age = as.numeric(victim_age),
+         )|>
+  filter(!city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"))|> 
+           filter(victim_race %in% c("White", "Black"))|>
+  select(city_state, resolution, victim_age, victim_sex, victim_race)
+```
+
+```{r}
+baltimore_glm <- homicides |>
+  filter(city_state == "Baltimore, MD") |>
+  glm(formula = resolution ~ victim_age + victim_sex + victim_race, data = _, family = binomial())
+
+baltimore_glm |> 
+  broom::tidy() |> 
+  mutate(
+    OR = exp(estimate), 
+    OR_CI_upper = exp(estimate + 1.96 * std.error),
+    OR_CI_lower = exp(estimate - 1.96 * std.error)) |> 
+  filter(term == "victim_sexMale") |> 
+  select(OR, OR_CI_lower, OR_CI_upper) |>
+  knitr::kable(digits = 3)
+```
+```{r}
+model_results <- homicides |>
+  group_by(city_state) |>
+  nest() |>
+  mutate(
+    models = map(data, function(df) {
+      glm(resolution ~ victim_age + victim_sex + victim_race, family = binomial(), data = df)
+    }),
+    tidy_models = map(models, broom::tidy)
+  ) |>
+  select(-models, -data) |>
+  unnest(cols = tidy_models) |>
+  mutate(
+    OR = exp(estimate),
+    OR_CI_upper = exp(estimate + 1.96 * std.error),
+    OR_CI_lower = exp(estimate - 1.96 * std.error)
+  ) |>
+  filter(term == "victim_sexMale") |>
+  select(city_state, OR, OR_CI_lower, OR_CI_upper) |>
+  ungroup()
+
+model_results |>
+  knitr::kable(digits = 3)
+```
+```{r}
+model_results |>
+  mutate(city_state = fct_reorder(city_state, OR)) |>
+  ggplot(aes(x = city_state, y = OR)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = OR_CI_lower, ymax = OR_CI_upper)) +
+  coord_flip() +  
+  labs(x = "city_state", y = "OR") +
+  theme_minimal()
+```
+
+The plot above shows the estimated ORs and CI for each city. The plot showed OR was less than 1 in most cities, meaning crimes with male victims are less likely to be resolved compared to those with female victims after accounting for victim age/race. New York showed the most disparity. About half of the cities show a narrow CI that doesn't include 1, showing statistically significant differences in resolution rates between the sexes after adjustments. 
+
+# Problem 2
+
+```{r}
+set.seed(1)
+
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2022-01-01",
+    date_max = "2022-12-31") |>
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) |>
+  select(name, id, everything())
+```
+
+## Fit the Regression Line
+
+```{r}
+fit = lm(tmax ~ tmin + prcp, data = weather_df)
+```
+## Bootstrapping
+
+Create a bootstrapping function.
+
+```{r}
+boot_sample = function(df){
+  sample_frac(df, replace = TRUE)
+}
+```
+
+Create 5000 bootstrapping samples by using a list column. 
+
+```{r}
+boot_straps = 
+  tibble(strap_number = 1:5000)|>
+  mutate(
+    strap_sample = map(strap_number, \(i) boot_sample(df = weather_df))
+  )
+
+boot_straps
+```
+
+### 95% Confidence Interval for $\hat{r^{2}}$
+
+For each bootstrap sample, produce estimates of the two desired quantities.
+
+```{r}
+bootstrap_results = 
+  boot_straps |> 
+  mutate(
+    models = map(strap_sample, \(df) lm(tmax ~ tmin + prcp, data = df) ),
+    results = map(models, broom::glance)) |> 
+  select(-strap_sample, -models) |> 
+  unnest(results) 
+
+# identify the 2.5% and 97.5% quantiles to provide a 95% confidence interval for estimated r^2
+r_squared = bootstrap_results |> 
+  summarize(
+    lower_r_squared = quantile(r.squared, 0.025),
+    upper_r_squared = quantile(r.squared, 0.975)) |> 
+  knitr::kable(digits = 3)
+```
+Therefore, the 2.5% and 97.5% quantiles to provide a 95% confidence interval for estimated $\hat{r^{2}}$ is approximately 0.889 and 0.941. We're 95% confident that the true estimated r^2 lies between 0.889 and 0.941. 
+
+### Plot the Distribution of $\hat{r^{2}}$
+
+```{r}
+bootstrap_results|>
+  ggplot(aes(x = r.squared)) +
+  geom_density(fill = "blue") +
+  theme_minimal() +
+  labs(
+    title = "Estimated R-Squared Distribution Plot",
+    x = "estimated r-squared",
+    y = "density"
+  )
+```
+
+Based on the density plot of estimated r-squared, the distribution is slightly left-skewed and most of the data points gathered around 0.91 to 0.92. Since the large percent of the variability in the outcome can be explained by the regression model. As a result, this indicates that our model is in goodness of fit if solely based on the r-squared distribution. 
+
+### 95% CI for $\log(\hat{\beta_0}*\hat{\beta_1})$
+
+```{r}
+logresult = 
+  boot_straps |> 
+  mutate(
+    models = map(strap_sample, \(df) lm(tmax ~ tmin + prcp, data = df) ),
+    log_results = map(models, broom::tidy)) |> 
+  select(-strap_sample, -models) |> 
+  unnest(log_results)|>
+  filter(term == "tmin"|term == "prcp")|>
+  select(strap_number:estimate)|>
+  pivot_wider(names_from = term,
+              values_from = estimate)|>
+  mutate(log_estimates = log(tmin*prcp))|>
+  na.omit()|>
+   summarize(
+    lower_log_estimates = quantile(log_estimates, 0.025),
+    upper_log_estimates = quantile(log_estimates, 0.975)) |> 
+  knitr::kable(digits = 3)
+  
+```
+
+Therefore, the 95% CI of $\log(\hat{\beta_0}*\hat{\beta_1})$ is approximately (-8.982, -4.602). We're 95% confident that the true estimated $\log(\hat{\beta_0}*\hat{\beta_1})$ coefficient lies between -8.982 and -4.602. 
+
+### Plot the Distribution of $\log(\hat{\beta_0}*\hat{\beta_1})$
+
+```{r}
+  boot_straps |> 
+  mutate(
+    models = map(strap_sample, \(df) lm(tmax ~ tmin + prcp, data = df) ),
+    log_results = map(models, broom::tidy)) |> 
+  select(-strap_sample, -models) |> 
+  unnest(log_results)|>
+  filter(term == "tmin"|term == "prcp")|>
+  select(strap_number:estimate)|>
+  pivot_wider(names_from = term,
+              values_from = estimate)|>
+  mutate(log_estimates = log(tmin*prcp))|>
+  na.omit()|>
+  ggplot(aes(x = log_estimates)) +
+  geom_density(fill = "yellow") +
+  theme_minimal() +
+  labs(
+    title = "Estimated log(tmin*prcp) Distribution Plot",
+    x = "estimated log(tmin*prcp)",
+    y = "density"
+  )
+```
+
+Based on the density plot of estimated $\log(\hat{\beta_0}*\hat{\beta_1})$, the distribution is left-skewed and most of the data points gathered around -6, which corresponds to our previous 95% CI. After log transformation, the distribution is not normal.
+
+# Problem 3
+
+```{r}
+birthweight <- read.csv("./data/birthweight.csv")
+```
+
+```{r}
+birthweight <- birthweight |>
+  mutate(
+    babysex = as_factor(babysex),
+    frace = as_factor(frace),
+    mrace = as_factor(mrace)
+  )
+
+# check missing value
+sum(is.na(birthweight))
+```
+
+```{r}
+test_regression_model <- lm(bwt ~ ., data = birthweight)
+summary(test_regression_model)
+
+# chose those who p-value < 0.05
+birthweight_regression_model <- lm(bwt ~ babysex + bhead + blength + delwt + gaweeks + parity + smoken, data = birthweight)
+
+residuals <- birthweight |>
+  add_predictions(birthweight_regression_model, var = "pred") |>
+  add_residuals(birthweight_regression_model, var = "resid")
+```
+```{r}
+ggplot(residuals, aes(x = pred, y = resid)) +
+  geom_point() +
+  labs(x = "Fitted Values", y = "Residuals")
+```
+
+```{r}
+# Model comparison using cross-validation
+cv_folds <- crossv_mc(birthweight, 100) 
+
+cv_results <- cv_folds |>
+  mutate(
+    model0 = map(train, \(df) lm(bwt ~ delwt + gaweeks + smoken, data = df)),
+    model1 = map(train, \(df) lm(bwt ~ blength + gaweeks, data = df)),
+    model2 = map(train, \(df) lm(bwt ~ bhead + blength + babysex + bhead * blength + blength * babysex + bhead * babysex + bhead * blength * babysex, data = df)),
+    rmse0 = map2_dbl(model0, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse1 = map2_dbl(model1, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse2 = map2_dbl(model2, test, \(mod, df) rmse(model = mod, data = df))
+  )
+```
+
+```{r}
+cv_results |> 
+  select(starts_with("rmse")) |> 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") |> 
+  mutate(model = fct_inorder(model)) |> 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+In this Graph, with rmse2 < rmse1 < rmse0 showing above. The model produced above has the highest RMSE values, suggesting that it may be the least accurate model. In contrast, Model 2 (head circumference, length, sex, and all interactions) has the lowest RMSE values and the smallest variability, suggesting that it is the most accurate and consistent model of the three.
